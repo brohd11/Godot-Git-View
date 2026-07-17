@@ -1,0 +1,55 @@
+@tool
+extends EditorPlugin
+
+## Owns the script-editor diff gutter, driven by the shared GitService (registered as a consumer).
+## The main-screen scaffolding below is a stub for the eventual full-screen git view.
+
+const DiffGutter = preload("res://addons/git_view/src/git_diff_gutter.gd")
+
+var diff_gutter:DiffGutter
+
+
+func _get_plugin_name() -> String:
+	return "Git View"
+func _get_plugin_icon() -> Texture2D:
+	return EditorInterface.get_base_control().get_theme_icon("Node", &"EditorIcons")
+func _has_main_screen() -> bool:
+	return true
+
+func _make_visible(visible:bool) -> void:
+	pass
+
+func _enable_plugin() -> void:
+	pass
+
+func _disable_plugin() -> void:
+	pass
+
+func _enter_tree() -> void:
+	var gs = GitService.register_node(self)
+
+	diff_gutter = DiffGutter.new()
+	add_child(diff_gutter)
+	gs.repos_updated.connect(_on_git_repos_updated)
+	gs.status_updated.connect(_on_git_status_updated)
+	# repos_updated already fired during registration, above — sync the current list in
+	diff_gutter.set_repos(gs.repos)
+
+
+func _exit_tree() -> void:
+	# the gutter added gutters into CodeEdits that outlive us — tear those out before we free
+	if is_instance_valid(diff_gutter):
+		diff_gutter.clean_up()
+	GitService.unregister_node(self)
+
+
+# A commit is a new baseline for every script open under that repo; the gutter flushes and re-reads
+# baselines when HEAD moves.
+func _on_git_status_updated(repo_dir:String) -> void:
+	if is_instance_valid(diff_gutter):
+		diff_gutter.head_moved(repo_dir, GitService.get_instance().get_branch_oid())
+
+
+func _on_git_repos_updated() -> void:
+	if is_instance_valid(diff_gutter):
+		diff_gutter.set_repos(GitService.get_instance().repos)
