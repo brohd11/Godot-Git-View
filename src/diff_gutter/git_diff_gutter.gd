@@ -393,7 +393,8 @@ func _minimap_geometry(code_edit:CodeEdit) -> Dictionary:
 			code_edit.get_minimap_line_at_pos(Vector2i(0, c + 1)),
 		]
 		samples.sort()
-		first_line = samples[1] - 1
+		first_line = samples[1]
+	
 	return {
 		Keys.H: h,
 		Keys.CONTENT_BOTTOM: content_bottom,
