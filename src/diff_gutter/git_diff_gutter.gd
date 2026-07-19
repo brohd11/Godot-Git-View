@@ -6,8 +6,10 @@ extends Node
 ## `git show HEAD:<path>`, the diff from GitDiff. Hunks are kept per editor even though only the
 ## markers are drawn — the diff preview reads them rather than diffing the same buffer twice.
 
+const UtilsLocal = preload("res://addons/git_view/src/util/utils_local.gd")
 const UtilsRemote = preload("res://addons/git_view/src/util/utils_remote.gd")
 
+const SettingHelperEditor = UtilsRemote.SettingHelperEditor
 const ScriptListManager = UtilsRemote.ScriptListManager
 
 const GitUtil = UtilsRemote.GitUtil
@@ -39,6 +41,29 @@ const COLOR_ADDED = GitUtil.Colors.L_GREEN
 const COLOR_MODIFIED = GitUtil.Colors.L_YELLOW
 const COLOR_DELETED = GitUtil.Colors.RED
 
+## What to draw for a file with no baseline to diff against. FULL is the ordinary treatment — the
+## baseline is empty, so every line reads as added; DIM is one muted bar down the whole file; OFF
+## takes the gutter away entirely.
+enum Mode {
+	OFF,
+	DIM,
+	FULL,
+}
+
+var setting_helper:SettingHelperEditor
+
+## Set from editor settings. Ignored is a bool and not a Mode: FULL for a file git will never see is
+## the noise this went in to fix, so the only real choice is a muted bar or nothing.
+var _show_ignored:bool = true
+## Untracked but not ignored defaults to FULL — every line of it really is uncommitted.
+var _untracked_mode:int = Mode.DIM
+
+const WASH_ALPHA = 0.5
+## Gray for what git will never track, green for what it has simply not seen yet — derived from
+## COLOR_ADDED so it stays the muted version of the bar the same file gets at FULL.
+const COLOR_WASH_IGNORED = GitUtil.Colors.DIM
+const COLOR_WASH_UNTRACKED = Color(COLOR_ADDED, WASH_ALPHA)
+
 ## Time before checking current line on text changed
 const RECOMPUTE_DEBOUNCE = 0.2
 
@@ -68,6 +93,12 @@ func _ready() -> void:
 	
 	ScriptEditorRef.subscribe(ScriptEditorRef.Event.TAB_CHANGED, _on_script_editor_tab_changed, 1)
 	
+	setting_helper = SettingHelperEditor.new()
+	setting_helper.subscribe_property(self, &"_show_ignored", UtilsLocal.EditorSet.GUTTER_IGNORE, true)
+	setting_helper.subscribe_property(self, &"_untracked_mode", UtilsLocal.EditorSet.GUTTER_UNTRACKED, Mode.DIM)
+	setting_helper.initialize()
+	
+	setting_helper.settings_changed.connect(apply_settings, 1)
 	# initialize
 	_attach_current_code_edit()
 
@@ -94,6 +125,20 @@ func head_moved(repo_dir:String, oid:String) -> void:
 			_baselines.erase(path)
 
 	_refresh_all()
+
+
+## Call after changing _show_ignored or _untracked_mode. What is drawn is as much a function of the
+## settings as of the buffer, and a settings change touches neither the text nor a baseline — so
+## nothing would otherwise bump VERSION, and the minimap cache would keep serving the old rects.
+##
+## The baselines deliberately survive: no setting can make a `git show` result stale, and re-reading
+## every open file off-thread to change a color would be waste.
+func apply_settings() -> void:
+	for id in _editors:
+		_editors[id][Keys.CACHE_KEY] = null
+	_refresh_all()
+	# OFF is the one mode with no gutter column at all, so crossing it either way re-attaches
+	_attach_current_code_edit()
 
 
 func clean_up() -> void:
@@ -152,7 +197,15 @@ func _attach(code_edit:CodeEdit, path:String) -> void:
 		# taken its repo away
 		_detach(code_edit)
 		return
-	
+
+	# a file already known to be drawn as nothing gets no gutter added and removed again on every
+	# visit to its tab, which would shift the text sideways each time. A first open still flickers:
+	# the answer is not known until the baseline thread returns.
+	var known:Dictionary = _baselines.get(path, {})
+	if not known.is_empty() and _mode_for(known[Keys.HEAD]) == Mode.OFF:
+		_detach(code_edit)
+		return
+
 	_ensure_gutter(code_edit)
 
 	var id = code_edit.get_instance_id()
@@ -163,6 +216,8 @@ func _attach(code_edit:CodeEdit, path:String) -> void:
 	if not state.has(Keys.MARKERS):
 		state[Keys.MARKERS] = PackedByteArray()
 		state[Keys.HUNKS] = []
+		state[Keys.NO_BASELINE] = false
+		state[Keys.WASH_COLOR] = COLOR_WASH_IGNORED
 		state[Keys.VERSION] = 0
 		state[Keys.CACHE] = []
 		state[Keys.CACHE_KEY] = null
@@ -276,6 +331,15 @@ func _draw_gutter(line:int, _gutter:int, rect:Rect2, code_edit:CodeEdit) -> void
 	# over the edge — and clip_contents is false here, so anything past it lands on the scrollbar
 	var bounds = Rect2(Vector2.ZERO, code_edit.size)
 
+	# the whole file wears this one and nothing else, so it answers for the row on its own.
+	# Defaulted, not indexed: a hot-reload rebinds live instances to the new script while keeping the
+	# state they already had, so an entry built before WASH_COLOR existed would otherwise hard-error
+	# here once per row per frame.
+	if mask & GitDiff.Marker.NO_BASELINE:
+		_draw_clamped(code_edit, Rect2(rect.position, Vector2(BAR_WIDTH * scale, rect.size.y)),
+			state.get(Keys.WASH_COLOR, COLOR_WASH_IGNORED), bounds)
+		return
+
 	if mask & (GitDiff.Marker.ADDED | GitDiff.Marker.MODIFIED):
 		var color = COLOR_MODIFIED if mask & GitDiff.Marker.MODIFIED else COLOR_ADDED
 		_draw_clamped(code_edit, Rect2(rect.position, Vector2(BAR_WIDTH * scale, rect.size.y)),
@@ -305,8 +369,11 @@ func _draw_clamped(code_edit:CodeEdit, rect:Rect2, color:Color, bounds:Rect2) ->
 # untouched editor, hence the cache.
 func _draw_minimap(code_edit:CodeEdit) -> void:
 	var state:Dictionary = _editors.get(code_edit.get_instance_id(), {})
-	# hunks and not markers: an unmodified file is the common case and this is the whole cost of it
-	if state.is_empty() or state[Keys.HUNKS].is_empty():
+	# hunks and not markers: an unmodified file is the common case and this is the whole cost of it.
+	# A wash is the one thing with markers and no hunks, so it has to be asked about separately.
+	if state.is_empty():
+		return
+	if state[Keys.HUNKS].is_empty() and not state.get(Keys.NO_BASELINE, false):
 		return
 	if not code_edit.is_drawing_minimap():
 		return
@@ -332,7 +399,7 @@ func _minimap_rects(code_edit:CodeEdit, state:Dictionary) -> Array:
 	if state.get(Keys.CACHE_KEY) == key:
 		return state[Keys.CACHE]
 
-	var rects = _build_minimap_rects(code_edit, state[Keys.MARKERS], geometry)
+	var rects = _build_minimap_rects(code_edit, state, geometry)
 	state[Keys.CACHE_KEY] = key
 	state[Keys.CACHE] = rects
 	return rects
@@ -402,7 +469,10 @@ func _minimap_geometry(code_edit:CodeEdit) -> Dictionary:
 	}
 
 
-func _build_minimap_rects(code_edit:CodeEdit, markers:PackedByteArray, geometry:Dictionary) -> Array:
+# Takes the whole state and not just its markers: a wash's color is a per-file fact that no marker
+# byte carries, so the run below has to be able to ask for it.
+func _build_minimap_rects(code_edit:CodeEdit, state:Dictionary, geometry:Dictionary) -> Array:
+	var markers:PackedByteArray = state[Keys.MARKERS]
 	var rects:Array = []
 	var h:int = geometry[Keys.H]
 	var height = code_edit.size.y
@@ -447,7 +517,11 @@ func _build_minimap_rects(code_edit:CodeEdit, markers:PackedByteArray, geometry:
 
 		var color = COLOR_DELETED
 		var rect := Rect2(x, top, bar_width, tick_height)
-		if mask & (GitDiff.Marker.ADDED | GitDiff.Marker.MODIFIED):
+		if mask & GitDiff.Marker.NO_BASELINE:
+			# one run for the whole file, the coalescing above having already collapsed it
+			color = state.get(Keys.WASH_COLOR, COLOR_WASH_IGNORED)
+			rect = Rect2(x, top, bar_width, bottom - top)
+		elif mask & (GitDiff.Marker.ADDED | GitDiff.Marker.MODIFIED):
 			color = COLOR_MODIFIED if mask & GitDiff.Marker.MODIFIED else COLOR_ADDED
 			rect = Rect2(x, top, bar_width, bottom - top)
 
@@ -493,6 +567,30 @@ func _refresh_all() -> void:
 		_recompute(id)
 
 
+# Nothing to say about this file: no marks, and no gutter column to hold them either.
+func _blank(state:Dictionary, code_edit:CodeEdit) -> void:
+	state[Keys.HUNKS] = []
+	state[Keys.MARKERS] = PackedByteArray()
+	state[Keys.NO_BASELINE] = false
+	state[Keys.VERSION] += 1
+	_remove_gutter(code_edit)
+
+
+# The mode a head state is drawn under. The settings are read here and nowhere else, so everything
+# downstream of this speaks one vocabulary — a file git could answer for is never anything but FULL.
+func _mode_for(head:int) -> int:
+	match head:
+		GitUtil.Head.IGNORED: return Mode.DIM if _show_ignored else Mode.OFF
+		GitUtil.Head.ABSENT:  return _untracked_mode
+		_:                    return Mode.FULL
+
+
+# Which muted color a wash uses — the whole point of separating IGNORED from ABSENT, since the two
+# would otherwise be the same fact by the time anything draws.
+func _wash_color(head:int) -> Color:
+	return COLOR_WASH_IGNORED if head == GitUtil.Head.IGNORED else COLOR_WASH_UNTRACKED
+
+
 # Resolves the editor's buffer against its baseline. Cheap enough for a keystroke's debounce: the
 # trim in GitDiff means a one line edit costs a one line diff, whatever the file's size.
 func _recompute(id:int) -> void:
@@ -509,20 +607,30 @@ func _recompute(id:int) -> void:
 	if baseline.is_empty():
 		return # still in flight — leave whatever is drawn rather than blank it and blink
 
+	var head:int = baseline[Keys.HEAD]
+
 	# the repo would not answer, so anything drawn now would be a guess — a machine with no git on
 	# PATH would otherwise light up every open script
-	if baseline[Keys.HEAD] == GitUtil.Head.ERROR:
-		state[Keys.HUNKS] = []
-		state[Keys.MARKERS] = PackedByteArray()
-		state[Keys.VERSION] += 1
-		_remove_gutter(code_edit)
+	if head == GitUtil.Head.ERROR or _mode_for(head) == Mode.OFF:
+		_blank(state, code_edit)
 		return
 
-	# ABSENT arrives as an empty baseline, so a file git has never seen diffs as entirely added,
-	# which is what it is
+	if _mode_for(head) == Mode.DIM:
+		state[Keys.HUNKS] = []
+		state[Keys.NO_BASELINE] = true
+		state[Keys.WASH_COLOR] = _wash_color(head)
+		# a uniform fill needs the count and not the lines themselves
+		state[Keys.MARKERS] = GitDiff.fill_markers(code_edit.get_line_count(), GitDiff.Marker.NO_BASELINE)
+		state[Keys.VERSION] += 1
+		code_edit.queue_redraw()
+		return
+
+	# Mode.FULL falls through: ABSENT and IGNORED both arrive as an empty baseline, so a file git has
+	# never seen diffs as entirely added, which is what it is
 	var new_lines = GitDiff.to_lines(code_edit.text)
 	var hunks = GitDiff.diff_lines(baseline[Keys.LINES], new_lines)
 
+	state[Keys.NO_BASELINE] = false
 	state[Keys.HUNKS] = hunks
 	state[Keys.MARKERS] = GitDiff.hunks_to_markers(hunks, new_lines.size())
 	# what the minimap cache watches — an int to compare, rather than the marker array itself
@@ -592,6 +700,12 @@ class Keys:
 	const HUNKS = &"hunks"
 	## bumped whenever MARKERS is rebuilt, so the minimap cache has an int to compare
 	const VERSION = &"version"
+	## whether MARKERS is a whole file wash rather than a diff — the one case with markers but no
+	## hunks, which the minimap's early out would otherwise read as "nothing to draw"
+	const NO_BASELINE = &"no_baseline"
+	## the wash's Color, resolved once where the settings are read so the per-frame draws need no
+	## notion of why a file has no baseline. Only meaningful while NO_BASELINE is true.
+	const WASH_COLOR = &"wash_color"
 	## the minimap marks as [Rect2, Color], and what they were computed for
 	const CACHE = &"minimap_cache"
 	const CACHE_KEY = &"minimap_cache_key"

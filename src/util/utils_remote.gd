@@ -5,7 +5,9 @@ const GitDiff = GitService.GitDiff
 const GlyphIcons = preload("uid://dvguymko6if63") #! resolve GitService.GlyphIcons
 
 
-const ScriptListManager = ALibEditor.Singleton.ScriptListManager
+const ScriptListManager = preload("uid://d3o6grkkmk4qk") #! resolve ALibEditor.Singleton.ScriptListManager
+
+const SettingHelperEditor = preload("uid://c4l4v4eufkmtx") #! resolve ALibEditor.Settings.SettingHelperEditor
 
 const RightClickHandler = preload("uid://mmtkf4h8er3m") #! resolve ClickHandlers.RightClickHandler
 const Options = preload("uid://c61qxuau2v0pb") #! resolve ALibRuntime.Popups.Options
