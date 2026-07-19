@@ -326,7 +326,7 @@ func _minimap_rects(code_edit:CodeEdit, state:Dictionary) -> Array:
 	var key = [
 		state[Keys.VERSION],
 		code_edit.size,
-		geometry[Keys.ANCHOR_LINE],
+		geometry[Keys.FIRST_LINE],
 		code_edit.get_total_visible_line_count(),
 	]
 	if state.get(Keys.CACHE_KEY) == key:
@@ -338,13 +338,12 @@ func _minimap_rects(code_edit:CodeEdit, state:Dictionary) -> Array:
 	return rects
 
 
-# What the minimap is currently showing, as a row height, the lines it draws, and one line whose
-# position is known.
+# What the minimap is currently showing, as a row height and the first line it draws.
 #
-# The anchor must be probed at an exact multiple of the row height: get_minimap_line_at_pos() adds
-# the fractional part of get_v_scroll() before flooring, so a y that divides evenly is stable while
-# any other flips by a line as you scroll through it. Probing off a multiple is what used to flicker.
-#! keys h:float drawn:int anchor_line:int anchor_row:int
+# Positions are measured from that first line, never from a probe that moves with the scroll:
+# get_minimap_line_at_pos() folds the fractional part of the scroll into its answer, so a fixed probe
+# pixel flips by a line as you scroll even while a fitting minimap sits still — which is what jittered.
+#! keys h:int content_bottom:float first_line:int
 func _minimap_geometry(code_edit:CodeEdit) -> Dictionary:
 	# capacity, not the count actually drawn: it is floor(minimap_height / row_height), so it stays put
 	# whatever the file's length, and dividing the height back by it recovers the row height
@@ -355,7 +354,8 @@ func _minimap_geometry(code_edit:CodeEdit) -> Dictionary:
 	# x is ignored by the mapping — pos(0, y) and pos(2000, y) answer the same — so it stays 0
 	var margin = code_edit.get_theme_stylebox(&"normal").get_margin(SIDE_TOP)
 	var margin_bottom = code_edit.get_theme_stylebox(&"normal").get_margin(SIDE_BOTTOM)
-
+	#print(code_edit.get_theme_stylebox(&"normal"))
+	
 	# the lines the minimap actually paints, and the pixel span they cover. A rough row height from the
 	# capacity is enough to place the probes — the accurate one comes from measuring below.
 	var drawn = mini(code_edit.get_total_visible_line_count(), capacity)
@@ -370,22 +370,40 @@ func _minimap_geometry(code_edit:CodeEdit) -> Dictionary:
 	var la = code_edit.get_minimap_line_at_pos(Vector2i(0, ya))
 	var lb = code_edit.get_minimap_line_at_pos(Vector2i(0, yb))
 	var between = code_edit.get_visible_line_count_in_range(la, lb) - 1
-	# kept a float: rounding to a whole pixel drifts a run a row every ~1/frac lines from the anchor
-	var h = h_approx if between <= 0 else (yb - ya) / float(between)
+	var h_float = h_approx if between <= 0 else (yb - ya) / float(between)
+	# an integer row height for positioning: it puts the row boundaries on whole pixels, so the anchor
+	# probe lands cleanly on one and get_minimap_line_at_pos does not flip it back and forth on a scroll.
+	# the float is kept only for the content extent below, which never feeds the probe.
+	var h = maxi(1, int(round(h_float)))
+	var content_bottom = drawn * h_float
 
-	# row 1 and not row 0: at a scroll fraction of exactly 0 the top row answers one line low
-	var anchor_row = 1
+	# the first line the minimap paints. A fitting file (the common case) never scrolls its minimap, so
+	# it is a hard 0 — no scroll-sensitive probe, nothing for a mark to jitter with.
+	var first_line = 0
+	if code_edit.get_total_visible_line_count() > capacity:
+		# get_minimap_line_at_pos answers floor((y - margin)/h + scroll_fraction), so it is steady only
+		# where (y - margin) is a whole multiple of the row height — off a multiple the fraction tips the
+		# floor across a line as you scroll, which is the jitter. Probe the FIRST full row below the margin
+		# (y - margin == h, a multiple, and clear of the top edge where y == margin dips on a low fraction),
+		# median a ±1px window to absorb any rounding when h is not exactly integral, then drop that one row.
+		var c: int = int(margin) + h
+		var samples: PackedInt32Array = [
+			code_edit.get_minimap_line_at_pos(Vector2i(0, c - 1)),
+			code_edit.get_minimap_line_at_pos(Vector2i(0, c)),
+			code_edit.get_minimap_line_at_pos(Vector2i(0, c + 1)),
+		]
+		samples.sort()
+		first_line = samples[1] - 1
 	return {
 		Keys.H: h,
-		Keys.DRAWN: drawn,
-		Keys.ANCHOR_ROW: anchor_row,
-		Keys.ANCHOR_LINE: code_edit.get_minimap_line_at_pos(Vector2i(0, int(margin + anchor_row * h))),
+		Keys.CONTENT_BOTTOM: content_bottom,
+		Keys.FIRST_LINE: first_line,
 	}
 
 
 func _build_minimap_rects(code_edit:CodeEdit, markers:PackedByteArray, geometry:Dictionary) -> Array:
 	var rects:Array = []
-	var h:float = geometry[Keys.H]
+	var h:int = geometry[Keys.H]
 	var height = code_edit.size.y
 	var scale = EditorInterface.get_editor_scale()
 
@@ -401,7 +419,7 @@ func _build_minimap_rects(code_edit:CodeEdit, markers:PackedByteArray, geometry:
 	# stop at the drawn content, not code_edit.size: a short file's minimap ends well above the bottom,
 	# and a long one is inset by the bottom margin — either way a run past it should clip, not fill down
 	var margin_bottom = code_edit.get_theme_stylebox(&"normal").get_margin(SIDE_BOTTOM)
-	var mini_bottom = minf(height - margin_bottom, geometry[Keys.DRAWN] * h)
+	var mini_bottom = minf(height - margin_bottom, geometry[Keys.CONTENT_BOTTOM])
 	var bounds = Rect2(0, 0, code_edit.size.x, mini_bottom)
 
 	# by run and not by row: at ~3px a line a per line rect is a stack of slivers, and a hunk is one
@@ -419,6 +437,10 @@ func _build_minimap_rects(code_edit:CodeEdit, markers:PackedByteArray, geometry:
 
 		var top = _minimap_y(code_edit, geometry, start)
 		var bottom = _minimap_y(code_edit, geometry, i - 1) + h
+		# a run reaching the file's last line should fill to the true content bottom: integer stepping
+		# leaves it a few px short on a short file (and over on a long one), and mini_bottom is exact
+		if i >= markers.size():
+			bottom = mini_bottom
 		if bottom <= 0.0 or top >= height:
 			continue # scrolled off the minimap
 
@@ -435,16 +457,16 @@ func _build_minimap_rects(code_edit:CodeEdit, markers:PackedByteArray, geometry:
 	return rects
 
 
-# Where the minimap draws a line, counted in rows from the anchor. get_visible_line_count_in_range()
-# makes this arithmetic rather than a search, folds and wraps included.
+# Where the minimap draws a line, counted in rows from the first drawn line (which sits at pixel 0).
+# get_visible_line_count_in_range() makes this arithmetic rather than a search, folds and wraps included.
 func _minimap_y(code_edit:CodeEdit, geometry:Dictionary, line:int) -> float:
-	var anchor:int = geometry[Keys.ANCHOR_LINE]
+	var first:int = geometry[Keys.FIRST_LINE]
 	var rows:int
-	if line >= anchor:
-		rows = code_edit.get_visible_line_count_in_range(anchor, line) - 1
+	if line >= first:
+		rows = code_edit.get_visible_line_count_in_range(first, line) - 1
 	else:
-		rows = -(code_edit.get_visible_line_count_in_range(line, anchor) - 1)
-	return (geometry[Keys.ANCHOR_ROW] + rows) * float(geometry[Keys.H])
+		rows = -(code_edit.get_visible_line_count_in_range(line, first) - 1)
+	return float(rows * int(geometry[Keys.H]))
 
 #endregion
 
@@ -575,10 +597,10 @@ class Keys:
 
 	## one entry of _minimap_geometry()
 	const H = &"row_height"
-	## lines the minimap actually paints — min(total visible, capacity)
-	const DRAWN = &"drawn"
-	const ANCHOR_LINE = &"anchor_line"
-	const ANCHOR_ROW = &"anchor_row"
+	## the drawn content's pixel extent from the minimap top, for the bottom clamp
+	const CONTENT_BOTTOM = &"content_bottom"
+	## the first line the minimap paints (0 unless it is scrolled), the reference every mark is placed from
+	const FIRST_LINE = &"first_line"
 
 	## one entry of _baselines, and REPO is on an _editors entry too
 	const REPO = &"repo"
