@@ -89,6 +89,9 @@ var _pending:Array = []
 
 var git_service:GitService
 
+var _diff_preview_panel:DiffPreviewPanel
+var _diff_code_edit:CodeEdit
+
 func _ready() -> void:
 	_debounce = Timer.new()
 	_debounce.one_shot = true
@@ -241,6 +244,9 @@ func _attach(code_edit:CodeEdit, path:String) -> void:
 	if not code_edit.draw.is_connected(_draw_minimap):
 		code_edit.draw.connect(_draw_minimap.bind(code_edit))
 
+	if not code_edit.gutter_clicked.is_connected(_on_gutter_clicked):
+		code_edit.gutter_clicked.connect(_on_gutter_clicked.bind(code_edit))
+
 	# draw from the cache now so a tab switch does not flicker
 	# refresh regardless: commit in terminal never reaches filesystem_changed
 	if _baselines.has(path):
@@ -255,6 +261,8 @@ func _detach(code_edit:CodeEdit) -> void:
 		code_edit.text_changed.disconnect(_on_text_changed.bind(code_edit))
 	if code_edit.draw.is_connected(_draw_minimap):
 		code_edit.draw.disconnect(_draw_minimap.bind(code_edit))
+	if code_edit.gutter_clicked.is_connected(_on_gutter_clicked):
+		code_edit.gutter_clicked.disconnect(_on_gutter_clicked)
 	_remove_gutter(code_edit)
 	_editors.erase(code_edit.get_instance_id())
 	_dirty.erase(code_edit.get_instance_id())
@@ -293,6 +301,7 @@ func _ensure_gutter(code_edit:CodeEdit) -> void:
 	code_edit.set_gutter_width(idx, int(GUTTER_WIDTH * EditorInterface.get_editor_scale()))
 	code_edit.set_gutter_draw(idx, true)
 	code_edit.set_gutter_overwritable(idx, false)
+	code_edit.set_gutter_clickable(idx, true)
 
 
 # By name: add_gutter shifts every later index, and other plugins add gutters too
@@ -317,6 +326,32 @@ func _remove_gutter(code_edit:CodeEdit) -> void:
 		code_edit.remove_gutter(idx)
 		code_edit.queue_redraw()
 
+func _on_gutter_clicked(line:int, gutter_idx:int, code_edit:CodeEdit):
+	if _find_gutter(code_edit) != gutter_idx:
+		return
+	var state:Dictionary = _editors.get(code_edit.get_instance_id(), {})
+	if state.is_empty():
+		return
+	
+	var markers:PackedByteArray = state[Keys.MARKERS]
+	if line < 0 or line >= markers.size():
+		return
+	var mask = markers[line]
+	if mask == 0:
+		return
+	
+	var hunk = _hunk_for_line(state, line, code_edit.get_line_count())
+	if hunk.is_empty():
+		return # a wash / clean / context-only line — nothing to preview
+	
+	_diff_preview_panel.queue_free()
+	_diff_preview_panel = null
+	
+	if not is_instance_valid(_diff_preview_panel):
+		_diff_preview_panel = DiffPreviewPanel.new()
+		EditorInterface.get_base_control().add_child(_diff_preview_panel)
+	
+	_diff_preview_panel.display_hunk(hunk, line, code_edit)
 
 # Called from inside TextEdit's _draw, once per visible row: _recompute resolved the hunks into one
 # byte per line and this reads it.
@@ -489,6 +524,26 @@ func _refresh_all() -> void:
 		_recompute(id)
 
 
+# The hunk drawn over a given new-text line, or {} if the line carries no change. New-side spans
+# mirror hunks_to_markers(): NEW_START is 1-based unless NEW_COUNT is 0, where it already names the
+# 0-based line the removal sits in front of. Hunks never overlap, so first match wins.
+func _hunk_for_line(state:Dictionary, line:int, line_count:int) -> Dictionary:
+	for hunk:Dictionary in state[Keys.HUNKS]:
+		var new_count:int = hunk[GitUtil.Keys.NEW_COUNT]
+		var start:int
+		var span:int
+		if new_count == 0:
+			# a pure deletion owns no line; its tick draws on NEW_START, or the last line at EOF
+			start = mini(hunk[GitUtil.Keys.NEW_START], maxi(0, line_count - 1))
+			span = 1
+		else:
+			start = hunk[GitUtil.Keys.NEW_START] - 1
+			span = new_count
+		if line >= start and line < start + span:
+			return hunk
+	return {}
+
+
 # Nothing to say about this file: no marks, and no gutter column to hold them either.
 func _blank(state:Dictionary, code_edit:CodeEdit) -> void:
 	state[Keys.HUNKS] = []
@@ -635,3 +690,142 @@ class Keys:
 	const REPO = &"repo"
 	const LINES = &"lines"
 	const HEAD = &"head"
+
+
+class DiffPreviewPanel extends PanelContainer:
+	
+	const COLOR_GREEN = Color(GitUtil.Colors.GREEN, 0.25)
+	const COLOR_RED = Color(GitUtil.Colors.RED, 0.25)
+	
+	const PANEL_MARGIN = 4
+	
+	var close_marg:MarginContainer
+	var close_button:Button
+	var code_edit:CodeEdit
+	
+	var _target_code_edit:CodeEdit
+	var current_line:int
+	
+	var current_lines = {}
+	
+	func _ready() -> void:
+		name = "DiffPreview"
+		
+		var sb = StyleBoxFlat.new()
+		sb.content_margin_top = _scaled(PANEL_MARGIN)
+		sb.content_margin_bottom = _scaled(PANEL_MARGIN)
+		sb.set_content_margin_all(_scaled(PANEL_MARGIN))
+		sb.bg_color = UtilsRemote.EditorColors.get_theme_color(UtilsRemote.EditorColors.ThemeColor.ACCENT)
+		add_theme_stylebox_override("panel", sb)
+		
+		code_edit = CodeEdit.new()
+		code_edit.syntax_highlighter = GDScriptSyntaxHighlighter.new()
+		#code_edit.mouse_exited.connect(code_edit.hide)
+		add_child(code_edit)
+		code_edit.add_theme_color_override(&"font_readonly_color", Color.WHITE)
+		code_edit.draw_tabs = true
+		code_edit.editable = false
+		
+		
+		
+		close_marg = MarginContainer.new()
+		code_edit.add_child(close_marg)
+		close_marg.add_theme_constant_override("margin_right", 8 * EditorInterface.get_editor_scale())
+		close_marg.set_anchors_and_offsets_preset.call_deferred(Control.PRESET_TOP_RIGHT)
+
+		close_button = Button.new()
+		close_marg.add_child(close_button)
+		close_button.icon = EditorInterface.get_editor_theme().get_icon(&"Close", &"EditorIcons")
+		close_button.theme_type_variation = &"FlatButton"
+		close_button.pressed.connect(_on_hide)
+		close_button.flat = true
+		
+		var script_tab = EditorNodeRef.get_node_ref(EditorNodeRef.Nodes.SCRIPT_EDITOR_TAB_CONTAINER)
+		script_tab.tab_changed.connect(_on_editor_tab_changed)
+	
+	func display_hunk(hunk:Dictionary, line:int, target_code_edit:CodeEdit):
+		_set_preview_position(line, target_code_edit)
+		var gutter_pos = target_code_edit.get_pos_at_line_column(line, 0)
+		
+		current_lines = {}
+		
+		var line_height = target_code_edit.get_line_height()
+		var line_count = 0
+		var lines = hunk.get(Keys.LINES, [])
+		
+		var target_line = line - hunk.get(GitUtil.Keys.NEW_START)
+		for i in range(lines.size()):
+			line_count += 1
+			var l_data = lines[i]
+			print(l_data)
+			code_edit.insert_line_at(i, l_data.get(GitUtil.Keys.TEXT))
+			match l_data.get(GitUtil.Keys.ORIGIN):
+				"+":
+					code_edit.set_line_background_color(i, COLOR_GREEN)
+					
+				"-":
+					code_edit.set_line_background_color(i, COLOR_RED)
+				_:
+					pass
+		
+		
+		
+		var height = mini(
+			line_height * (line_count + 2) + (2 * _scaled(PANEL_MARGIN)),
+			#code_edit.size.y + (2 * _scaled(PANEL_MARGIN)),
+			target_code_edit.size.y - gutter_pos.y - (_scaled(PANEL_MARGIN))
+			)
+		
+		var clipped_size = target_code_edit.size.x - gutter_pos.x
+		#code_edit.text = disp_text
+		custom_minimum_size = Vector2.ZERO
+		
+		size = Vector2(clipped_size, height)
+		code_edit.size = Vector2(clipped_size, height)
+		
+		show()
+		
+		_target_code_edit = target_code_edit
+		current_line = line
+		
+		print(target_line)
+		code_edit.set_line_as_center_visible.call_deferred(target_line)
+		
+		#_manage_scroll_signal(true)
+	
+	func _on_code_edit_scrolled(_scroll_val:int):
+		if not visible or not is_instance_valid(_target_code_edit):
+			return
+		_set_preview_position(current_line, _target_code_edit)
+	
+	func _set_preview_position(line:int, target_code_edit:CodeEdit):
+		var gutter_pos = target_code_edit.get_pos_at_line_column(line, 0)
+		var global_pos = target_code_edit.global_position
+		global_pos.x += target_code_edit.get_total_gutter_width() - _scaled(PANEL_MARGIN)
+		global_pos.y += gutter_pos.y
+		position = global_pos
+	
+	func _scaled(val:float):
+		return EditorInterface.get_editor_scale() * val
+	
+	func _manage_scroll_signal(connect_state:bool):
+		if not is_instance_valid(_target_code_edit):
+			return
+		var scroll = _target_code_edit.get_v_scroll_bar()
+		if scroll.value_changed.is_connected(_on_code_edit_scrolled):
+			if not connect_state:
+				scroll.value_changed.disconnect(_on_code_edit_scrolled)
+		else:
+			if connect_state:
+				scroll.value_changed.connect(_on_code_edit_scrolled)
+	
+	func _on_editor_tab_changed(tab:int):
+		if visible:
+			_on_hide()
+	
+	func _on_hide():
+		hide()
+		_manage_scroll_signal(false)
+		code_edit.text = ""
+		_target_code_edit = null
+		current_line = -1

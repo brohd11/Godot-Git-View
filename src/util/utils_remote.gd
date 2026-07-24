@@ -6,6 +6,7 @@ const GitDiff = GitService.GitDiff
 const NUItemList = ALibRuntime.NodeUtils.NUItemList
 const FSSmallPopup = preload("uid://1gdu201y6jro") #! resolve ALibEditor.FileSystem.Component.SmallPopup
 
+const EditorColors = ALibEditor.Colors
 const ScriptListManager = preload("uid://d3o6grkkmk4qk") #! resolve ALibEditor.Singleton.ScriptListManager
 
 const SettingHelperEditor = preload("uid://c4l4v4eufkmtx") #! resolve ALibEditor.Settings.SettingHelperEditor

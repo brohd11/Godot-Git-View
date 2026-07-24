@@ -73,7 +73,7 @@ func _on_item_right_clicked():
 	
 	_add_command_options(options, selected_paths)
 
-	ScriptDock.get_right_click_handler().display_popup(options)
+	right_click_handler.display_popup(options)
 
 
 # One entry per command with something to do to the selection: each is handed only the subset it

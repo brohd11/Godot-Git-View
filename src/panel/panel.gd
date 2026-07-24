@@ -10,6 +10,8 @@ extends VBoxContainer
 const UtilsRemote = preload("res://addons/git_view/src/util/utils_remote.gd")
 const UControl = UtilsRemote.UControl
 const TabBarContainer = UtilsRemote.TabBarContainer
+const RightClickHandler = UtilsRemote.RightClickHandler
+const Options = UtilsRemote.Options
 
 const UtilsLocal = preload("res://addons/git_view/src/util/utils_local.gd")
 
@@ -20,8 +22,13 @@ const CommitList = preload("res://addons/git_view/src/panel/commit_list.gd")
 const MAIN_REPO = "res://"
 const MAIN_REPO_TITLE = "Project"
 
-var repo_option_button:OptionButton
-var branch_row:HBoxContainer
+var right_click_handler:RightClickHandler
+
+var repo_popup_button:Button
+var repo_label:Label
+var top_row:HBoxContainer
+var branch_hbox:HBoxContainer
+var branch_texture:TextureRect
 var branch_label:Label
 var divergence_label:Label
 var tab_container:TabBarContainer
@@ -49,25 +56,49 @@ func set_dock_data(data:Dictionary) -> void:
 
 
 func _ready() -> void:
-	branch_row = HBoxContainer.new()
-	branch_row.mouse_filter = Control.MOUSE_FILTER_STOP
-	add_child(branch_row)
+	right_click_handler = RightClickHandler.new()
+	add_child(right_click_handler)
 	
-	repo_option_button = OptionButton.new()
-	repo_option_button.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
-	repo_option_button.item_selected.connect(_on_repo_selected)
-	repo_option_button.add_theme_stylebox_override("panel", StyleBoxEmpty.new())
-	branch_row.add_child(repo_option_button)
+	top_row = HBoxContainer.new()
+	top_row.mouse_filter = Control.MOUSE_FILTER_STOP
+	add_child(top_row)
+	
+	repo_popup_button = Button.new()
+	repo_popup_button.theme_type_variation = &"FlatButton"
+	repo_popup_button.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	repo_popup_button.icon = EditorInterface.get_editor_theme().get_icon(&"TexturePreviewChannels", &"EditorIcons")
+	repo_popup_button.pressed.connect(_on_repo_popup_pressed)
+	top_row.add_child(repo_popup_button)
+	
+	repo_label = Label.new()
+	repo_label.text = MAIN_REPO_TITLE
+	repo_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
+	top_row.add_child(repo_label)
+	repo_label.add_theme_stylebox_override(&"normal", StyleBoxEmpty.new())
+	
+	
+	#branch_row.add_spacer(false)
+	top_row.add_child(VSeparator.new())
+	
+	branch_hbox = HBoxContainer.new()
+	top_row.add_child(branch_hbox)
+	
+	branch_texture = TextureRect.new()
+	branch_texture.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	branch_texture.texture = EditorInterface.get_editor_theme().get_icon(&"VcsBranches", &"EditorIcons")
+	branch_texture.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	branch_hbox.add_child(branch_texture)
 
 	# the branch name gives way: ellipsis trims the end of a string, so a combined label would eat the divergence — the half worth acting on
 	branch_label = Label.new()
-	branch_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	branch_label.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
-	branch_label.mouse_filter = Control.MOUSE_FILTER_STOP
-	branch_row.add_child(branch_label)
+	#branch_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	#branch_label.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
+	branch_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	branch_hbox.add_child(branch_label)
+	branch_label.add_theme_stylebox_override(&"normal", StyleBoxEmpty.new())
 
 	divergence_label = Label.new()
-	branch_row.add_child(divergence_label)
+	branch_hbox.add_child(divergence_label)
 
 	tab_container = TabBarContainer.new()
 	add_child(tab_container)
@@ -77,6 +108,7 @@ func _ready() -> void:
 	change_list.name = "Changes"
 	change_list.changes_command.connect(_on_changes_command)
 	tab_container.add_tab(change_list)
+	change_list.right_click_handler = right_click_handler
 	UtilsLocal.set_item_list_sb(change_list)
 
 	commit_list = CommitList.new()
@@ -136,30 +168,31 @@ func clean_up() -> void:
 		_git.status_updated.disconnect(_on_status_updated)
 	if _git.commits_updated.is_connected(_on_commits_updated):
 		_git.commits_updated.disconnect(_on_commits_updated)
-	if _git.repos_updated.is_connected(_on_repos_updated):
-		_git.repos_updated.disconnect(_on_repos_updated)
+	
+	#if _git.repos_updated.is_connected(_on_repos_updated):
+		#_git.repos_updated.disconnect(_on_repos_updated)
 
 
 func _on_repos_updated() -> void:
-	repo_option_button.clear()
+	return
+
+
+func _on_repo_popup_pressed():
+	var options = Options.new()
 	for repo in _git.repos:
-		var repo_name = MAIN_REPO_TITLE if repo == MAIN_REPO else repo.trim_suffix("/").get_file()
-		repo_option_button.add_item(repo_name)
-		repo_option_button.set_item_metadata(repo_option_button.item_count - 1, repo)
+		options.add_option("Repo/" + _get_repo_name(repo), _select_repo.bind(repo))
+	
+	right_click_handler.display_on_control(options, repo_popup_button, Vector2(0, repo_popup_button.size.y))
 
-	var idx = _git.repos.find(_git.current_repo)
-	if idx > -1:
-		repo_option_button.select(idx)
-
-
-func _on_repo_selected(idx:int) -> void:
-	var repo_dir = repo_option_button.get_item_metadata(idx)
+func _select_repo(repo_dir:String):
 	if _git.current_repo == repo_dir:
 		return
 	# don't leave the old repo's rows up while the new repo's git calls run — the branch least of all
 	_clear_lists()
 	_git.set_repo(repo_dir)
 
+func _get_repo_name(repo_dir:String):
+	return MAIN_REPO_TITLE if repo_dir == MAIN_REPO else repo_dir.trim_suffix("/").get_file()
 
 # Don't leave one repo's rows up while another's data is in flight — the old branch under the new
 # repo's name is a worse lie than showing nothing.
@@ -171,7 +204,7 @@ func _clear_lists() -> void:
 
 	branch_label.text = ""
 	divergence_label.hide()
-	branch_row.tooltip_text = ""
+	top_row.tooltip_text = ""
 
 
 func _on_status_updated(_repo_dir:String) -> void:
@@ -184,9 +217,12 @@ func _on_status_updated(_repo_dir:String) -> void:
 func _update_repo_info() -> void:
 	var info = GitUtil.get_repo_info(_git.status, _git.commits)
 	var branch:Dictionary = info[GitUtil.Keys.BRANCH]
+	
+	repo_label.text = _get_repo_name(_git.current_repo)
 
-	branch_label.text = GitUtil.get_branch_label(branch)
-	branch_label.tooltip_text = GitUtil.format_repo_tooltip(info)
+	#branch_label.text = GitUtil.get_branch_label(branch)
+	branch_label.text = branch.get(GitUtil.Keys.BRANCH_NAME)
+	branch_hbox.tooltip_text = GitUtil.format_repo_tooltip(info)
 
 	var divergence = GitUtil.get_divergence_label(branch)
 	divergence_label.text = divergence
@@ -208,7 +244,7 @@ func _on_commits_updated(_repo_dir:String) -> void:
 func _rebuild_change_list() -> void:
 	if not is_instance_valid(_git):
 		return
-
+	
 	var files:Dictionary = _git.status.get(GitUtil.Keys.FILES, {})
 	var paths = files.keys()
 	paths.sort()
